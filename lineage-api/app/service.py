@@ -6,7 +6,7 @@ import sqlite3
 import sys
 from collections import defaultdict
 
-from . import db
+from . import db, planning
 from .exceptions import (
     ConflictLineageError,
     CycleDetectedError,
@@ -338,6 +338,86 @@ def analyze_impact(
         "unavailable_count": len(unavailable),
         "unavailable_nodes": unavailable,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Minimum-cost recalculation plan
+# --------------------------------------------------------------------------- #
+
+def plan_recalculation(
+    targets: list[str],
+    costs: dict[str, float],
+    db_path: str | None = None,
+) -> dict:
+    """Validate a replan request and compute the minimum-cost execution plan.
+
+    The whole lineage snapshot is read inside one read-only transaction, so
+    concurrent registrations can never make the plan mix two definitions.
+    Planning itself never writes to the database.
+    """
+    # The whole graph must come from one consistent snapshot.
+    with db.snapshot(db_path) as conn:
+        kinds, groups = load_graph(conn)
+
+        # ---- target validation ----
+        unknown = sorted({name for name in targets if name not in kinds})
+        if unknown:
+            raise NotFoundLineageError(
+                "目标报表列存在未登记的字段名", {"unknown": unknown}
+            )
+        duplicate_targets = sorted(
+            {name for name in targets if targets.count(name) > 1}
+        )
+        source_targets = sorted(
+            {name for name in targets if kinds[name] == "source"}
+        )
+        non_report_targets = sorted(
+            {
+                name
+                for name in targets
+                if kinds[name] != "report" and name not in source_targets
+            }
+        )
+        problems: dict[str, list] = {}
+        if duplicate_targets:
+            problems["duplicate_targets"] = duplicate_targets
+        if source_targets:
+            problems["source_targets"] = source_targets
+        if non_report_targets:
+            problems["non_report_targets"] = non_report_targets
+
+        # ---- relevant non-source columns (backward closure over all groups) ----
+        relevant = planning.collect_relevant_non_source(targets, kinds, groups)
+        if len(relevant) > planning.MAX_RELEVANT_NON_SOURCE:
+            raise ValidationLineageError(
+                "相关非源列超过 16 个，拒绝规划",
+                {
+                    "limit": planning.MAX_RELEVANT_NON_SOURCE,
+                    "count": len(relevant),
+                    "relevant_non_source": relevant,
+                },
+            )
+
+        # ---- cost coverage ----
+        relevant_set = set(relevant)
+        missing_costs = sorted(name for name in relevant if name not in costs)
+        unexpected_costs = sorted(
+            name
+            for name in costs
+            if name not in relevant_set or kinds.get(name) == "source"
+        )
+        if missing_costs:
+            problems["missing_costs"] = missing_costs
+        if unexpected_costs:
+            problems["unexpected_costs"] = unexpected_costs
+        if problems:
+            raise ValidationLineageError(
+                "重算请求校验失败，未生成计划", problems
+            )
+
+        plan = planning.build_plan(targets, dict(costs), kinds, groups)
+
+    return plan
 
 
 # --------------------------------------------------------------------------- #

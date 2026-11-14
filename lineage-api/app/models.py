@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, confloat
 
 NodeKind = Literal["source", "derived", "report"]
+
+# Non-negative finite execution cost (NaN / +/-infinity are rejected).
+NonNegativeCost = confloat(ge=0, allow_inf_nan=False)
 
 
 class NodeIn(BaseModel):
@@ -70,3 +73,40 @@ class NodeOut(BaseModel):
 class GraphResponse(BaseModel):
     nodes: list[NodeOut]
     counts: dict[str, int]
+
+
+# --------------------------------------------------------------------------- #
+# Recalculation plan
+# --------------------------------------------------------------------------- #
+
+
+class ReplanRequest(BaseModel):
+    targets: list[str] = Field(
+        ..., min_length=1, description="需要重算的目标报表列（已登记节点名）"
+    )
+    costs: dict[str, NonNegativeCost] = Field(
+        ...,
+        description=(
+            "相关非源列（derived / report）的执行成本，必须为非负有限数；"
+            "源列无需执行，不允许出现在这里。"
+        ),
+    )
+
+
+class PlannedColumn(BaseModel):
+    name: str
+    kind: NodeKind
+    group_index: int = Field(description="该列选用的候选输入组下标（从 0 开始）")
+    inputs: list[str] = Field(description="所选候选组内的输入字段")
+    cost: float
+
+
+class ReplanResponse(BaseModel):
+    targets: list[str]
+    total_cost: float
+    columns: list[PlannedColumn] = Field(
+        description="每个执行列选用的候选组（按列名排序）"
+    )
+    execution_order: list[str] = Field(
+        description="满足依赖的执行顺序：被依赖者先执行"
+    )

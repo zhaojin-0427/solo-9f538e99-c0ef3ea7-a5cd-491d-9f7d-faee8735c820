@@ -1,0 +1,8 @@
+{
+  "targets": ["report_gmv", "report_coupon_rate"],
+  "costs": {
+    "net_amt": 8.0,
+    "report_gmv": 2.0,
+    "report_coupon_rate": 3.0
+  }
+}

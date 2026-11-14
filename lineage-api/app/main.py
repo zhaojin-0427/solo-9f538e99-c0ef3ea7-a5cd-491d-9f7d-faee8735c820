@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import math
 import sqlite3
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import service
@@ -17,7 +19,29 @@ from .models import (
     ImpactResponse,
     RegisterRequest,
     RegisterResponse,
+    ReplanRequest,
+    ReplanResponse,
 )
+
+
+def _json_safe(value: object) -> object:
+    """Make pydantic error payloads strictly JSON encodable.
+
+    NaN / Infinity inputs are rejected by the model but still echoed in the
+    default 422 body, which crashes starlette's strict JSON encoder; render
+    such values as explicit strings instead.
+    """
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Infinity" if value > 0 else "-Infinity"
+        return value
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 @asynccontextmanager
@@ -48,6 +72,21 @@ async def _lineage_error_handler(
             "error": exc.code,
             "message": exc.message,
             "details": exc.details,
+        },
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_error_handler(
+    _request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    # Sanitize first so non-finite floats never break JSON encoding.
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": "validation_error",
+            "message": "请求体不合法",
+            "details": {"errors": _json_safe(exc.errors())},
         },
     )
 
@@ -99,3 +138,13 @@ def impact(payload: ImpactRequest) -> dict:
 def graph() -> dict:
     """查看当前已提交的完整血缘快照。"""
     return service.get_graph()
+
+
+@app.post(
+    "/lineage/replan",
+    response_model=ReplanResponse,
+    tags=["lineage"],
+)
+def replan(payload: ReplanRequest) -> dict:
+    """在同一血缘快照内规划全局最低成本的重算任务。"""
+    return service.plan_recalculation(payload.targets, payload.costs)
